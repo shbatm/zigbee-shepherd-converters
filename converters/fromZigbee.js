@@ -30,6 +30,17 @@ const precisionRound = (number, precision) => {
     return Math.round(number * factor) / factor;
 };
 
+const calibrateOptions = (number, options, type) => {
+    const key = `${type}_calibration`;
+    let calibrationOffset = options && options.hasOwnProperty(key) ? options[key] : 0;
+    if (type == 'illuminance') {
+        // linear calibration because measured value is zero based
+        // +/- percent
+        calibrationOffset = Math.round(number * calibrationOffset / 100);
+    }
+    return number + calibrationOffset;
+};
+
 const toPercentage = (value, min, max) => {
     if (value > max) {
         value = max;
@@ -123,6 +134,30 @@ const ictcg1 = (model, msg, publish, options, action) => {
     s.publish(payload);
 };
 
+const ratelimitedDimmer = (model, msg, publish, options) => {
+    const deviceID = msg.endpoints[0].device.ieeeAddr;
+    const payload = {};
+    let duration = 0;
+
+    if (!store[deviceID]) {
+        store[deviceID] = {lastmsg: false};
+    }
+    const s = store[deviceID];
+
+    if (s.lastmsg) {
+        duration = Date.now() - s.lastmsg;
+    } else {
+        s.lastmsg = Date.now();
+    }
+
+    if (duration > 500) {
+        s.lastmsg = Date.now();
+        payload.action = 'brightness';
+        payload.brightness = msg.data.data.level;
+        publish(payload);
+    }
+};
+
 const holdUpdateBrightness324131092621 = (deviceID) => {
     if (store[deviceID] && store[deviceID].brightnessSince && store[deviceID].brightnessDirection) {
         const duration = Date.now() - store[deviceID].brightnessSince;
@@ -132,17 +167,26 @@ const holdUpdateBrightness324131092621 = (deviceID) => {
     }
 };
 
-
 const converters = {
     HS2SK_power: {
         cid: 'haElectricalMeasurement',
         type: ['attReport', 'readRsp'],
         convert: (model, msg, publish, options) => {
-            return {
-                power: msg.data.data['activePower'] / 10,
-                current: msg.data.data['rmsCurrent'] / 100,
-                voltage: msg.data.data['rmsVoltage'] / 100,
-            };
+            const result = {};
+
+            if (msg.data.data.hasOwnProperty('activePower')) {
+                result.power = msg.data.data['activePower'] / 10;
+            }
+
+            if (msg.data.data.hasOwnProperty('rmsCurrent')) {
+                result.current = msg.data.data['rmsCurrent'] / 100;
+            }
+
+            if (msg.data.data.hasOwnProperty('rmsVoltage')) {
+                result.voltage = msg.data.data['rmsVoltage'] / 100;
+            }
+
+            return result;
         },
     },
     generic_lock: {
@@ -447,7 +491,8 @@ const converters = {
         type: ['attReport', 'readRsp'],
         convert: (model, msg, publish, options) => {
             const temperature = parseFloat(msg.data.data['measuredValue']) / 100.0;
-            return {temperature: precisionRoundOptions(temperature, options, 'temperature')};
+            const calTemperature = calibrateOptions(temperature, options, 'temperature');
+            return {temperature: precisionRoundOptions(calTemperature, options, 'temperature')};
         },
     },
     generic_temperature_change: {
@@ -455,7 +500,8 @@ const converters = {
         type: 'devChange',
         convert: (model, msg, publish, options) => {
             const temperature = parseFloat(msg.data.data['measuredValue']) / 100.0;
-            return {temperature: precisionRoundOptions(temperature, options, 'temperature')};
+            const calTemperature = calibrateOptions(temperature, options, 'temperature');
+            return {temperature: precisionRoundOptions(calTemperature, options, 'temperature')};
         },
     },
     xiaomi_temperature: {
@@ -671,7 +717,7 @@ const converters = {
         cid: 'genBasic',
         type: ['attReport', 'readRsp'],
         convert: (model, msg, publish, options) => {
-            if (msg.data.data.hasOwnProperty('65281')) {
+            if (msg.data.data.hasOwnProperty('65281') && msg.data.data['65281'].hasOwnProperty('100')) {
                 return {contact: msg.data.data['65281']['100'] === 0};
             }
         },
@@ -708,11 +754,11 @@ const converters = {
                 result.color = {};
 
                 if (msg.data.data['currentX']) {
-                    result.color.x = precisionRound(msg.data.data['currentX'] / 65535, 3);
+                    result.color.x = precisionRound(msg.data.data['currentX'] / 65535, 4);
                 }
 
                 if (msg.data.data['currentY']) {
-                    result.color.y = precisionRound(msg.data.data['currentY'] / 65535, 3);
+                    result.color.y = precisionRound(msg.data.data['currentY'] / 65535, 4);
                 }
 
                 if (msg.data.data['currentSaturation']) {
@@ -750,11 +796,11 @@ const converters = {
                 result.color = {};
 
                 if (msg.data.data['currentX']) {
-                    result.color.x = precisionRound(msg.data.data['currentX'] / 65535, 3);
+                    result.color.x = precisionRound(msg.data.data['currentX'] / 65535, 4);
                 }
 
                 if (msg.data.data['currentY']) {
-                    result.color.y = precisionRound(msg.data.data['currentY'] / 65535, 3);
+                    result.color.y = precisionRound(msg.data.data['currentY'] / 65535, 4);
                 }
 
                 if (msg.data.data['currentSaturation']) {
@@ -791,7 +837,10 @@ const converters = {
         cid: 'msIlluminanceMeasurement',
         type: ['attReport', 'readRsp'],
         convert: (model, msg, publish, options) => {
-            return {illuminance: msg.data.data['measuredValue']};
+            const illuminance = msg.data.data['measuredValue'];
+            const calIlluminance = calibrateOptions(illuminance, options, 'illuminance');
+            // calibration value in +/- percent!
+            return {illuminance: calIlluminance};
         },
     },
     generic_pressure: {
@@ -799,7 +848,8 @@ const converters = {
         type: ['attReport', 'readRsp'],
         convert: (model, msg, publish, options) => {
             const pressure = parseFloat(msg.data.data['measuredValue']);
-            return {pressure: precisionRoundOptions(pressure, options, 'pressure')};
+            const calPressure = calibrateOptions(pressure, options, 'pressure');
+            return {pressure: precisionRoundOptions(calPressure, options, 'pressure')};
         },
     },
     WXKG02LM_click: {
@@ -871,7 +921,7 @@ const converters = {
         cid: 'genBasic',
         type: ['attReport', 'readRsp'],
         convert: (model, msg, publish, options) => {
-            if (msg.data.data.hasOwnProperty('65281')) {
+            if (msg.data.data.hasOwnProperty('65281') && msg.data.data['65281'].hasOwnProperty('100')) {
                 return {water_leak: msg.data.data['65281']['100'] === 1};
             }
         },
@@ -1234,13 +1284,14 @@ const converters = {
             return results;
         },
     },
-    heiman_gas: {
+    generic_ias_statuschange_gas: {
         cid: 'ssIasZone',
         type: 'statusChange',
         convert: (model, msg, publish, options) => {
             const zoneStatus = msg.data.zoneStatus;
             return {
                 gas: (zoneStatus & 1) > 0, // Bit 1 = Alarm: Gas
+                tamper: (zoneStatus & 1<<2) > 0, // Bit 3 = Tamper status
                 battery_low: (zoneStatus & 1<<3) > 0, // Bit 4 = Battery LOW indicator
             };
         },
@@ -1462,6 +1513,13 @@ const converters = {
                 '2': 'dig-in',
             };
 
+            let ds18b20Id = null;
+            let ds18b20Value = null;
+            if (msg.data.data['41368']) {
+                ds18b20Id = msg.data.data['41368'].split(':')[0];
+                ds18b20Value = precisionRound(msg.data.data['41368'].split(':')[1], 2);
+            }
+
             return {
                 state: msg.data.data['onOff'] === 1 ? 'ON' : 'OFF',
                 cpu_temperature: precisionRound(msg.data.data['41361'], 2),
@@ -1471,6 +1529,7 @@ const converters = {
                 adc_volt: precisionRound(msg.data.data['41365'], 3),
                 dig_input: msg.data.data['41366'],
                 reason: lookup[msg.data.data['41367']],
+                [`${ds18b20Id}`]: ds18b20Value,
             };
         },
     },
@@ -2647,6 +2706,25 @@ const converters = {
             return {position: msg.data.data.currentPositionLiftPercentage};
         },
     },
+    closuresWindowCovering_report_pos_and_tilt: {
+        cid: 'closuresWindowCovering',
+        type: ['attReport', 'readRsp'],
+        convert: (model, msg, publish, options) => {
+            const result = {};
+            // ZigBee officially expects "open" to be 0 and "closed" to be 100 whereas
+            // HomeAssistant etc. work the other way round.
+            // ubisys J1 will report 255 if lift or tilt positions are not known.
+            if (msg.data.data.hasOwnProperty('currentPositionLiftPercentage')) {
+                const liftPercentage = msg.data.data['currentPositionLiftPercentage'];
+                result.position = liftPercentage <= 100 ? (100 - liftPercentage) : null;
+            }
+            if (msg.data.data.hasOwnProperty('currentPositionTiltPercentage')) {
+                const tiltPercentage = msg.data.data['currentPositionTiltPercentage'];
+                result.tilt = tiltPercentage <= 100 ? (100 - tiltPercentage) : null;
+            }
+            return result;
+        },
+    },
     generic_fan_mode: {
         cid: 'hvacFanCtrl',
         type: 'attReport',
@@ -2840,7 +2918,7 @@ const converters = {
             return result;
         },
     },
-    ZNMS12LM_closuresDoorLock_report: {
+    ZNMS12LM_ZNMS13LM_closuresDoorLock_report: {
         cid: 'closuresDoorLock',
         type: 'attReport',
         convert: (model, msg, publish, options) => {
@@ -2862,6 +2940,7 @@ const converters = {
                 14: 'change_language_to',
                 15: 'finger_open',
                 16: 'password_open',
+                17: 'door_closed',
             };
             result.user = null;
             result.repeat = null;
@@ -2869,32 +2948,66 @@ const converters = {
                 // Convert data back to hex to decode
                 const data = Buffer.from(msg.data.data['65526'], 'ascii').toString('hex');
                 const command = data.substr(6, 4);
-                if (command === '0301') {
+                if (
+                    command === '0301' // ZNMS12LM
+                    || command === '0341' // ZNMS13LM
+                ) {
                     result.action = lockStatusLookup[4];
                     result.state = 'UNLOCK';
                     result.reverse = 'UNLOCK';
-                } else if (command === '0311') {
+                } else if (
+                    command === '0311' // ZNMS12LM
+                    || command === '0351' // ZNMS13LM
+                ) {
                     result.action = lockStatusLookup[4];
                     result.state = 'LOCK';
                     result.reverse = 'UNLOCK';
-                } else if (command === '0205') {
+                } else if (
+                    command === '0205' // ZNMS12LM
+                    || command === '0245' // ZNMS13LM
+                ) {
                     result.action = lockStatusLookup[3];
                     result.state = 'UNLOCK';
                     result.reverse = 'LOCK';
-                } else if (command === '0215') {
+                } else if (
+                    command === '0215' // ZNMS12LM
+                    || command === '0255' // ZNMS13LM
+                    || command === '1355' // ZNMS13LM
+                ) {
                     result.action = lockStatusLookup[3];
                     result.state = 'LOCK';
                     result.reverse = 'LOCK';
-                } else if (command === '0111') {
+                } else if (
+                    command === '0111' // ZNMS12LM
+                    || command === '1351' // ZNMS13LM locked from inside
+                    || command === '1451' // ZNMS13LM locked from outside
+                ) {
                     result.action = lockStatusLookup[5];
                     result.state = 'LOCK';
                     result.reverse = 'UNLOCK';
-                } else if (command === '0b00') {
+                } else if (
+                    command === '0b00' // ZNMS12LM
+                    || command === '0640' // ZNMS13LM
+                    ||command === '0600' // ZNMS13LM
+
+                ) {
                     result.action = lockStatusLookup[12];
                     result.state = 'UNLOCK';
                     result.reverse = 'UNLOCK';
-                } else if (command === '0c00') {
+                } else if (
+                    command === '0c00' // ZNMS12LM
+                    || command === '2300' // ZNMS13LM
+                    || command === '0540' // ZNMS13LM
+                    || command === '0440' // ZNMS13LM
+                ) {
                     result.action = lockStatusLookup[11];
+                    result.state = 'UNLOCK';
+                    result.reverse = 'UNLOCK';
+                } else if (
+                    command === '2400' // ZNMS13LM door closed from insed
+                    || command === '2401' // ZNMS13LM door closed from outside
+                ) {
+                    result.action = lockStatusLookup[17];
                     result.state = 'UNLOCK';
                     result.reverse = 'UNLOCK';
                 }
@@ -3057,6 +3170,13 @@ const converters = {
             };
         },
     },
+    dimmer_passthru_brightness: {
+        cid: 'genLevelCtrl',
+        type: 'cmdMoveToLevelWithOnOff',
+        convert: (model, msg, publish, options) => {
+            ratelimitedDimmer(model, msg, publish, options);
+        },
+    },
 
     // Ignore converters (these message dont need parsing).
     ignore_fan_change: {
@@ -3176,7 +3296,7 @@ const converters = {
     },
     ignore_metering_change: {
         cid: 'seMetering',
-        type: 'devChange',
+        type: ['devChange', 'attReport'],
         convert: (model, msg, publish, options) => null,
     },
     ignore_electrical_change: {
